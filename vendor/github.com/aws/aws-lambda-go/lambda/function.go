@@ -5,37 +5,43 @@ package lambda
 import (
 	"context"
 	"encoding/json"
-	"reflect"
+	"os"
 	"time"
 
 	"github.com/aws/aws-lambda-go/lambda/messages"
 	"github.com/aws/aws-lambda-go/lambdacontext"
 )
 
+// Function struct which wrap the Handler
+//
+// Deprecated: The Function type is public for the go1.x runtime internal use of the net/rpc package
 type Function struct {
-	handler Handler
+	handler *handlerOptions
 }
 
+// NewFunction which creates a Function with a given Handler
+//
+// Deprecated: The Function type is public for the go1.x runtime internal use of the net/rpc package
+func NewFunction(handler Handler) *Function {
+	return &Function{newHandler(handler)}
+}
+
+// Ping method which given a PingRequest and a PingResponse parses the PingResponse
 func (fn *Function) Ping(req *messages.PingRequest, response *messages.PingResponse) error {
 	*response = messages.PingResponse{}
 	return nil
 }
 
+// Invoke method try to perform a command given an InvokeRequest and an InvokeResponse
 func (fn *Function) Invoke(req *messages.InvokeRequest, response *messages.InvokeResponse) error {
 	defer func() {
 		if err := recover(); err != nil {
-			panicInfo := getPanicInfo(err)
-			response.Error = &messages.InvokeResponse_Error{
-				Message:    panicInfo.Message,
-				Type:       getErrorType(err),
-				StackTrace: panicInfo.StackTrace,
-				ShouldExit: true,
-			}
+			response.Error = lambdaPanicResponse(err)
 		}
 	}()
 
 	deadline := time.Unix(req.Deadline.Seconds, req.Deadline.Nanos).UTC()
-	invokeContext, cancel := context.WithDeadline(context.Background(), deadline)
+	invokeContext, cancel := context.WithDeadline(fn.baseContext(), deadline)
 	defer cancel()
 
 	lc := &lambdacontext.LambdaContext{
@@ -54,7 +60,9 @@ func (fn *Function) Invoke(req *messages.InvokeRequest, response *messages.Invok
 	}
 	invokeContext = lambdacontext.NewContext(invokeContext, lc)
 
+	// nolint:staticcheck
 	invokeContext = context.WithValue(invokeContext, "x-amzn-trace-id", req.XAmznTraceId)
+	os.Setenv("_X_AMZN_TRACE_ID", req.XAmznTraceId)
 
 	payload, err := fn.handler.Invoke(invokeContext, req.Payload)
 	if err != nil {
@@ -65,23 +73,9 @@ func (fn *Function) Invoke(req *messages.InvokeRequest, response *messages.Invok
 	return nil
 }
 
-func getErrorType(err interface{}) string {
-	errorType := reflect.TypeOf(err)
-	if errorType.Kind() == reflect.Ptr {
-		return errorType.Elem().Name()
+func (fn *Function) baseContext() context.Context {
+	if fn.handler.baseContext != nil {
+		return fn.handler.baseContext
 	}
-	return errorType.Name()
-}
-
-func lambdaErrorResponse(invokeError error) *messages.InvokeResponse_Error {
-	var errorName string
-	if errorType := reflect.TypeOf(invokeError); errorType.Kind() == reflect.Ptr {
-		errorName = errorType.Elem().Name()
-	} else {
-		errorName = errorType.Name()
-	}
-	return &messages.InvokeResponse_Error{
-		Message: invokeError.Error(),
-		Type:    errorName,
-	}
+	return context.Background()
 }

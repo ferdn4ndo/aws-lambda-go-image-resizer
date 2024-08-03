@@ -4,6 +4,7 @@ package core
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -15,26 +16,26 @@ import (
 	"strings"
 
 	"github.com/aws/aws-lambda-go/events"
+	"github.com/aws/aws-lambda-go/lambdacontext"
 )
 
-// CustomHostVariable is the name of the environment variable that contains
-// the custom hostname for the request. If this variable is not set the framework
-// reverts to `DefaultServerAddress`. The value for a custom host should include
-// a protocol: http://my-custom.host.com
-const CustomHostVariable = "GO_API_HOST"
+const (
+	// CustomHostVariable is the name of the environment variable that contains
+	// the custom hostname for the request. If this variable is not set the framework
+	// reverts to `RequestContext.DomainName`. The value for a custom host should
+	// include a protocol: http://my-custom.host.com
+	CustomHostVariable = "GO_API_HOST"
 
-// DefaultServerAddress is prepended to the path of each incoming reuqest
-const DefaultServerAddress = "https://aws-serverless-go-api.com"
+	// APIGwContextHeader is the custom header key used to store the
+	// API Gateway context. To access the Context properties use the
+	// GetAPIGatewayContext method of the RequestAccessor object.
+	APIGwContextHeader = "X-GoLambdaProxy-ApiGw-Context"
 
-// APIGwContextHeader is the custom header key used to store the
-// API Gateway context. To access the Context properties use the
-// GetAPIGatewayContext method of the RequestAccessor object.
-const APIGwContextHeader = "X-GoLambdaProxy-ApiGw-Context"
-
-// APIGwStageVarsHeader is the custom header key used to store the
-// API Gateway stage variables. To access the stage variable values
-// use the GetAPIGatewayStageVars method of the RequestAccessor object.
-const APIGwStageVarsHeader = "X-GoLambdaProxy-ApiGw-StageVars"
+	// APIGwStageVarsHeader is the custom header key used to store the
+	// API Gateway stage variables. To access the stage variable values
+	// use the GetAPIGatewayStageVars method of the RequestAccessor object.
+	APIGwStageVarsHeader = "X-GoLambdaProxy-ApiGw-StageVars"
+)
 
 // RequestAccessor objects give access to custom API Gateway properties
 // in the request.
@@ -53,7 +54,7 @@ func (r *RequestAccessor) GetAPIGatewayContext(req *http.Request) (events.APIGat
 	context := events.APIGatewayProxyRequestContext{}
 	err := json.Unmarshal([]byte(req.Header.Get(APIGwContextHeader)), &context)
 	if err != nil {
-		log.Println("Erorr while unmarshalling context")
+		log.Println("Error while unmarshalling context")
 		log.Println(err)
 		return events.APIGatewayProxyRequestContext{}, err
 	}
@@ -71,7 +72,7 @@ func (r *RequestAccessor) GetAPIGatewayStageVars(req *http.Request) (map[string]
 	}
 	err := json.Unmarshal([]byte(req.Header.Get(APIGwStageVarsHeader)), &stageVars)
 	if err != nil {
-		log.Println("Erorr while unmarshalling stage variables")
+		log.Println("Error while unmarshalling stage variables")
 		log.Println(err)
 		return stageVars, err
 	}
@@ -102,13 +103,33 @@ func (r *RequestAccessor) StripBasePath(basePath string) string {
 	return newBasePath
 }
 
-// ProxyEventToHTTPRequest converts an API Gateway proxy event into an
-// http.Request object.
-// Returns the populated request with an additional two custom headers for the
-// stage variables and API Gateway context. To access these properties use
-// the GetAPIGatewayStageVars and GetAPIGatewayContext method of the RequestAccessor
-// object.
+// ProxyEventToHTTPRequest converts an API Gateway proxy event into a http.Request object.
+// Returns the populated http request with additional two custom headers for the stage variables and API Gateway context.
+// To access these properties use the GetAPIGatewayStageVars and GetAPIGatewayContext method of the RequestAccessor object.
 func (r *RequestAccessor) ProxyEventToHTTPRequest(req events.APIGatewayProxyRequest) (*http.Request, error) {
+	httpRequest, err := r.EventToRequest(req)
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
+	return addToHeader(httpRequest, req)
+}
+
+// EventToRequestWithContext converts an API Gateway proxy event and context into an http.Request object.
+// Returns the populated http request with lambda context, stage variables and APIGatewayProxyRequestContext as part of its context.
+// Access those using GetAPIGatewayContextFromContext, GetStageVarsFromContext and GetRuntimeContextFromContext functions in this package.
+func (r *RequestAccessor) EventToRequestWithContext(ctx context.Context, req events.APIGatewayProxyRequest) (*http.Request, error) {
+	httpRequest, err := r.EventToRequest(req)
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
+	return addToContext(ctx, httpRequest, req), nil
+}
+
+// EventToRequest converts an API Gateway proxy event into an http.Request object.
+// Returns the populated request maintaining headers
+func (r *RequestAccessor) EventToRequest(req events.APIGatewayProxyRequest) (*http.Request, error) {
 	decodedBody := []byte(req.Body)
 	if req.IsBase64Encoded {
 		base64Body, err := base64.StdEncoding.DecodeString(req.Body)
@@ -127,7 +148,7 @@ func (r *RequestAccessor) ProxyEventToHTTPRequest(req events.APIGatewayProxyRequ
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
-	serverAddress := DefaultServerAddress
+	serverAddress := "https://" + req.RequestContext.DomainName
 	if customAddress, ok := os.LookupEnv(CustomHostVariable); ok {
 		serverAddress = customAddress
 	}
@@ -144,6 +165,17 @@ func (r *RequestAccessor) ProxyEventToHTTPRequest(req events.APIGatewayProxyRequ
 			}
 		}
 		path += "?" + queryString
+	} else if len(req.QueryStringParameters) > 0 {
+		// Support `QueryStringParameters` for backward compatibility.
+		// https://github.com/awslabs/aws-lambda-go-api-proxy/issues/37
+		queryString := ""
+		for q := range req.QueryStringParameters {
+			if queryString != "" {
+				queryString += "&"
+			}
+			queryString += url.QueryEscape(q) + "=" + url.QueryEscape(req.QueryStringParameters[q])
+		}
+		path += "?" + queryString
 	}
 
 	httpRequest, err := http.NewRequest(
@@ -158,22 +190,68 @@ func (r *RequestAccessor) ProxyEventToHTTPRequest(req events.APIGatewayProxyRequ
 		return nil, err
 	}
 
-	for h := range req.Headers {
-		httpRequest.Header.Add(h, req.Headers[h])
+	if req.MultiValueHeaders != nil {
+		for k, values := range req.MultiValueHeaders {
+			for _, value := range values {
+				httpRequest.Header.Add(k, value)
+			}
+		}
+	} else {
+		for h := range req.Headers {
+			httpRequest.Header.Add(h, req.Headers[h])
+		}
 	}
 
-	apiGwContext, err := json.Marshal(req.RequestContext)
-	if err != nil {
-		log.Println("Could not Marshal API GW context for custom header")
-		return nil, err
-	}
-	stageVars, err := json.Marshal(req.StageVariables)
+	httpRequest.RequestURI = httpRequest.URL.RequestURI()
+
+	return httpRequest, nil
+}
+
+func addToHeader(req *http.Request, apiGwRequest events.APIGatewayProxyRequest) (*http.Request, error) {
+	stageVars, err := json.Marshal(apiGwRequest.StageVariables)
 	if err != nil {
 		log.Println("Could not marshal stage variables for custom header")
 		return nil, err
 	}
-	httpRequest.Header.Add(APIGwContextHeader, string(apiGwContext))
-	httpRequest.Header.Add(APIGwStageVarsHeader, string(stageVars))
+	req.Header.Set(APIGwStageVarsHeader, string(stageVars))
+	apiGwContext, err := json.Marshal(apiGwRequest.RequestContext)
+	if err != nil {
+		log.Println("Could not Marshal API GW context for custom header")
+		return req, err
+	}
+	req.Header.Set(APIGwContextHeader, string(apiGwContext))
+	return req, nil
+}
 
-	return httpRequest, nil
+func addToContext(ctx context.Context, req *http.Request, apiGwRequest events.APIGatewayProxyRequest) *http.Request {
+	lc, _ := lambdacontext.FromContext(ctx)
+	rc := requestContext{lambdaContext: lc, gatewayProxyContext: apiGwRequest.RequestContext, stageVars: apiGwRequest.StageVariables}
+	ctx = context.WithValue(ctx, ctxKey{}, rc)
+	return req.WithContext(ctx)
+}
+
+// GetAPIGatewayContextFromContext retrieve APIGatewayProxyRequestContext from context.Context
+func GetAPIGatewayContextFromContext(ctx context.Context) (events.APIGatewayProxyRequestContext, bool) {
+	v, ok := ctx.Value(ctxKey{}).(requestContext)
+	return v.gatewayProxyContext, ok
+}
+
+// GetRuntimeContextFromContext retrieve Lambda Runtime Context from context.Context
+func GetRuntimeContextFromContext(ctx context.Context) (*lambdacontext.LambdaContext, bool) {
+	v, ok := ctx.Value(ctxKey{}).(requestContext)
+	return v.lambdaContext, ok
+}
+
+// GetStageVarsFromContext retrieve stage variables from context
+func GetStageVarsFromContext(ctx context.Context) (map[string]string, bool) {
+	v, ok := ctx.Value(ctxKey{}).(requestContext)
+	return v.stageVars, ok
+}
+
+type ctxKey struct{}
+
+type requestContext struct {
+	lambdaContext       *lambdacontext.LambdaContext
+	gatewayProxyContext events.APIGatewayProxyRequestContext
+	stageVars           map[string]string
 }
